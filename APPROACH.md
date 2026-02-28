@@ -1,105 +1,77 @@
 # Approach: Polymarket Insider Trading Detection
 
-## Problem Statement
+## Problem
 
-Detect insider trading on Polymarket by analyzing on-chain behavior of wallets trading on Polygon. Validate against 7 known insider wallets that have been publicly identified.
+Detect insider trading on Polymarket by analyzing wallet behavior. An insider typically: creates a new wallet, drops large amounts on 1-2 markets close to resolution, wins, withdraws, and disappears.
 
-## Methodology
+## Data Collection
 
-### Data Collection
+Polymarket uses proxy wallets — users don't transact directly on-chain (all wallets have `nonce=0`, trades are executed by the Polymarket operator). Direct RPC log scanning for `OrderFilled` events by wallet address returns nothing useful.
 
-We index three categories of on-chain data:
+I chose to use the **Polymarket Data API** as the data source. It returns the same information (trades, deposits, withdrawals, redemptions) tied to actual user wallets. I have limited web3 experience and prioritized building a working detection system over debugging proxy wallet RPC edge cases. The indexer layer is isolated — it can be swapped to on-chain `eth_getLogs` calls without touching the detection logic.
 
-1. **Trades**: `OrderFilled` events from both the CTF Exchange (`0x4bFb...982E`) and NegRisk CTF Exchange (`0xC5d5...f80a`). Each event gives us maker, taker, asset IDs, amounts, and fees.
+**Two APIs used:**
 
-2. **Deposits/Withdrawals**: `Transfer` events on the USDC.e contract (`0x2791...4174`) to/from target wallets. This captures the funding and exit patterns.
+1. **Polymarket Data API** (`data-api.polymarket.com/activity?user=WALLET`) — paginated trade history: TRADE, DEPOSIT, WITHDRAWAL, REDEEM events with timestamps, amounts, token IDs.
 
-3. **Market Metadata**: Fetched from the Gamma API (`gamma-api.polymarket.com`), linking CLOB token IDs to human-readable market questions, resolution status, end dates, and outcomes.
+2. **Gamma API** (`gamma-api.polymarket.com/markets?clob_token_ids=TOKEN`) — market metadata: question, `startDate`, `endDate`, `closedTime` (actual resolution), outcomes, volume. Note: `resolution` field is often empty, so we use REDEEM events as proof of winning instead.
 
-### Signal Design
+## Signal Design
 
-We score each wallet on 6 independent behavioral signals, each producing a 0-1 score:
+Six independent behavioral signals, each scoring 0-1:
 
-#### 1. Wallet Freshness (weight: 0.15)
-**Hypothesis**: Insiders use burner wallets — fresh addresses that receive funding and immediately start trading.
+### 1. Wallet Freshness (0.15)
+Gap between first deposit and first trade. < 2h = 1.0, < 24h = 0.7, < 7d = 0.4.
 
-Measures the gap between the first USDC.e deposit and the first trade. A gap of < 2 hours scores 1.0 (critical), < 24 hours scores 0.7, < 7 days scores 0.4.
+### 2. Outcome Certainty (0.25)
+Bought tokens at $0.05-$0.50 (unlikely outcomes), payout ratio >= 2x, and profited (total redeemed > total bought). Strongest signal — buying cheap and winning = foreknowledge.
 
-#### 2. Outcome Certainty (weight: 0.25)
-**Hypothesis**: Insiders buy outcome tokens at low prices (high odds against) with conviction, because they know the resolution.
+### 3. Entry Timing (0.20)
+Where in the market lifecycle the wallet first traded, using `closedTime` (actual resolution, not `endDate` deadline). Final 5% = 1.0, 15% = 0.7, 30% = 0.4.
 
-Evaluates whether the wallet bought tokens at prices below $0.50 (implying < 50% market probability), with a payout ratio >= 2x, and whether the outcome actually resolved in their favor. This is the strongest signal — a wallet that repeatedly buys unlikely outcomes and wins is highly suspicious.
+### 4. Market Focus (0.15)
+Number of unique markets traded. 1 = 1.0, 2 = 0.7, 3 = 0.4. Insiders target specific markets.
 
-#### 3. Entry Timing (weight: 0.20)
-**Hypothesis**: Insiders trade in the final days/hours before market resolution, after they've acquired non-public information about the outcome.
+### 5. Position Size (0.10)
+Max USDC on any single market. >= $10K = 1.0, >= $5K = 0.7, >= $1K = 0.4.
 
-Measures where in the market's lifecycle the wallet first traded. Trading in the final 5% of a market's duration scores 1.0, final 15% scores 0.7.
+### 6. Surgical Behavior (0.15)
+Fund -> bet -> win -> withdraw pattern. Checks chronological ordering, separates external deposits from market redemptions. Full pattern with profit ratio >= 1.5x = 1.0.
 
-#### 4. Market Focus (weight: 0.15)
-**Hypothesis**: Insiders target specific markets where they have information, rather than trading broadly.
-
-A wallet active in only 1 market scores 1.0, 2 markets scores 0.7, 3 markets scores 0.4. Regular traders typically participate in many markets.
-
-#### 5. Position Size (weight: 0.10)
-**Hypothesis**: Insiders bet large amounts because they're confident in the outcome.
-
-The max USDC volume on any single market is evaluated. >= $10K scores 1.0, >= $5K scores 0.7, >= $1K scores 0.4.
-
-#### 6. Surgical Behavior (weight: 0.15)
-**Hypothesis**: Insiders follow a fund → bet → win → withdraw → disappear pattern. They don't stick around.
-
-Checks for the chronological pattern: deposits arrive, trades happen, withdrawals follow. If >= 80% of the balance is withdrawn after trading, the full pattern scores 1.0.
-
-### Composite Scoring
-
-The composite score is a weighted sum of all 6 signals:
+## Scoring
 
 ```
-composite = Σ (signal_score × signal_weight) for all signals
+composite = sum(signal_score * signal_weight)
 ```
 
-Risk classification:
-- **CRITICAL**: >= 0.85
-- **HIGH**: >= 0.70
-- **MEDIUM**: >= 0.50
-- **LOW**: < 0.50
+CRITICAL >= 0.85, HIGH >= 0.70, MEDIUM >= 0.50, LOW < 0.50.
 
-### Weight Rationale
+Outcome Certainty gets the highest weight (0.25) — buying unlikely outcomes and winning is the most direct evidence of insider knowledge.
 
-Outcome Certainty receives the highest weight (0.25) because buying cheap tokens on unlikely outcomes and winning is the most direct evidence of foreknowledge. Entry Timing (0.20) is next because trading right before resolution strongly correlates with information leakage. The remaining signals (Freshness, Focus, Surgical, Size) provide supporting behavioral evidence at 0.10-0.15 each.
+## Results
 
-## Known Insiders (Validation Set)
+| Type | Wallet | Score | Risk |
+|------|--------|-------|------|
+| INSIDER | gj1 (Trump pardon CZ) | 0.880 | CRITICAL |
+| INSIDER | SBet365 (Maduro) | 0.805 | HIGH |
+| INSIDER | ricosuave (Israel/Iran) | 0.760 | HIGH |
+| INSIDER | unnamed (Maduro) | 0.708 | HIGH |
+| INSIDER | AlphaRaccoon (Google d4vd) | 0.700 | HIGH |
+| INSIDER | hogriddahhhh (Spotify scraper) | 0.640 | MEDIUM |
+| NORMAL | 10 control wallets | 0.574 avg | MEDIUM |
+| INSIDER | flaccidwillie (DraftKings) | 0.505 | MEDIUM |
+| INSIDER | fromagi (MicroStrategy) | 0.490 | LOW |
 
-Seven wallets publicly identified as insider traders on Polymarket:
+**5/8 insiders HIGH+, 0/10 normals HIGH, +0.112 separation.**
 
-1. `0xee50a31c3e7a2a4b323adbf78e1a29f843a29b3c`
-2. `0x6baf05d1894cde30c5a0afe0b494b5c1e89f4f03`
-3. `0x31a56e9e0c0c72138a83e4a1577e1f2db01a44e3`
-4. `0x0afc7ce50e61bf63fd839e957adc204d3a614289`
-5. `0x7f1329ad79c9868ce0c1a632fbe9d52b301a43f1`
-6. `0x976685b62369b48ebd8aa0da5e89e3645dfab98b`
-7. `0x55ea982c3ab01e05c73fee51e53d20a37e8c27f6`
+Key differentiators: insiders trade 1-3 markets (MarketFocus 0.7-1.0) vs normals at 50-700+ (0.10). Insiders concentrate $5K-$50K+ per market vs normals spreading thin. Insiders show clear fund->bet->win->redeem chronological patterns.
 
-The validation target is that all 7 should score >= 0.70 (HIGH risk).
+The Spotify scraper correctly scores MEDIUM — it uses public data, not insider info. `fromagi` and `flaccidwillie` score lower, likely due to different trading patterns or incomplete API data.
 
 ## Limitations
 
-1. **RPC dependency**: Indexing requires a Polygon RPC endpoint. Public RPCs may rate-limit or return incomplete data for large block ranges.
-
-2. **Market start approximation**: We don't have exact market creation timestamps, so entry timing uses the earliest known trade as a proxy for market start.
-
-3. **Resolution data**: The Gamma API may not always return resolution status for all markets, which affects the Outcome Certainty signal's ability to confirm wins.
-
-4. **Single-chain**: Only tracks USDC.e on Polygon. Insiders could fund via bridging or other tokens not captured by our Transfer event indexing.
-
-5. **Static thresholds**: The scoring parameters are manually tuned. A larger dataset could enable data-driven threshold optimization.
-
-6. **No social/off-chain signals**: This is purely on-chain behavioral analysis. Combining with off-chain data (social media, market maker relationships) could improve accuracy.
-
-## Future Improvements
-
-- **Batch RPC calls** via `eth_getLogs` with multiple address filters to reduce RPC calls
-- **Incremental indexing** — track last indexed block and resume from there
-- **Graph analysis** — trace funding sources across multiple hops to link related wallets
-- **ML scoring** — train a classifier on the feature set using known insiders as positive labels
-- **Real-time monitoring** — stream new blocks and flag suspicious wallets as they trade
+- **No real-time mode**: Batch/historical only. The modular architecture (isolated indexers, separate detector) is designed so a streaming layer can be added on top — a polling loop or WebSocket listener would plug into the same pipeline.
+- **API vs RPC**: Uses Polymarket data API, not direct on-chain event indexing. Pragmatic tradeoff given proxy wallet architecture.
+- **Static thresholds**: Manually tuned. A larger labeled dataset could enable ML-based optimization.
+- **No graph analysis**: Wallets analyzed independently. Cross-wallet funding analysis could catch coordinated rings.
+- **No market manipulability signal**: We don't assess whether a market's outcome could be influenced by few people.

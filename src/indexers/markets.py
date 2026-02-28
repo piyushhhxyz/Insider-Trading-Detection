@@ -1,7 +1,8 @@
-"""Gamma API market metadata fetcher."""
+"""Gamma API market metadata fetcher (concurrent)."""
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import httpx
@@ -9,6 +10,9 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from src.config import GAMMA_API_URL
 from src.models import Market
+
+# Max concurrent requests to Gamma API
+MAX_CONCURRENCY = 20
 
 
 def _parse_market(data: dict) -> Market:
@@ -101,7 +105,7 @@ def _parse_market(data: dict) -> Market:
 
 
 def fetch_market_by_token(token_id: str) -> Market | None:
-    """Fetch market data from Gamma API for a given CLOB token ID."""
+    """Fetch market data from Gamma API for a given CLOB token ID (sync)."""
     url = f"{GAMMA_API_URL}/markets"
     try:
         resp = httpx.get(url, params={"clob_token_ids": token_id}, timeout=30)
@@ -111,7 +115,6 @@ def fetch_market_by_token(token_id: str) -> Market | None:
         if not data:
             return None
 
-        # API returns a list; take the first matching market
         market_data = data[0] if isinstance(data, list) else data
         return _parse_market(market_data)
 
@@ -119,28 +122,62 @@ def fetch_market_by_token(token_id: str) -> Market | None:
         return None
 
 
+async def _fetch_one(
+    client: httpx.AsyncClient,
+    token_id: str,
+    sem: asyncio.Semaphore,
+) -> tuple[str, Market | None]:
+    """Fetch a single token's market data with concurrency limit."""
+    url = f"{GAMMA_API_URL}/markets"
+    async with sem:
+        try:
+            resp = await client.get(url, params={"clob_token_ids": token_id}, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                return token_id, None
+            market_data = data[0] if isinstance(data, list) else data
+            return token_id, _parse_market(market_data)
+        except (httpx.HTTPError, KeyError, IndexError, Exception):
+            return token_id, None
+
+
+async def _fetch_all(to_fetch: list[str], progress, task_id) -> list[Market]:
+    """Fetch all markets concurrently."""
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    markets: list[Market] = []
+
+    async with httpx.AsyncClient() as client:
+        # Process in batches for progress updates
+        batch_size = 50
+        for i in range(0, len(to_fetch), batch_size):
+            batch = to_fetch[i : i + batch_size]
+            tasks = [_fetch_one(client, tid, sem) for tid in batch]
+            results = await asyncio.gather(*tasks)
+            for _tid, market in results:
+                if market:
+                    markets.append(market)
+            progress.update(task_id, advance=len(batch))
+
+    return markets
+
+
 def index_markets(token_ids: list[str], already_mapped: set[str] | None = None) -> list[Market]:
-    """Fetch market metadata for all token IDs not yet mapped."""
+    """Fetch market metadata for all token IDs not yet mapped (concurrent)."""
     skip = already_mapped or set()
     to_fetch = [t for t in token_ids if t not in skip]
 
     if not to_fetch:
         return []
 
-    markets: list[Market] = []
-
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}"),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("[cyan]{task.completed}/{task.total}"),
     ) as progress:
         task = progress.add_task("Fetching markets...", total=len(to_fetch))
-
-        for token_id in to_fetch:
-            market = fetch_market_by_token(token_id)
-            if market:
-                markets.append(market)
-            progress.update(task, advance=1)
+        markets = asyncio.run(_fetch_all(to_fetch, progress, task))
 
     return markets

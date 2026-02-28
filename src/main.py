@@ -8,7 +8,7 @@ import sys
 from rich.console import Console
 from rich.table import Table
 
-from src.config import KNOWN_INSIDERS
+from src.config import KNOWN_INSIDERS, NORMAL_WALLETS
 from src.db import Repository
 from src.detection.detector import Detector
 from src.indexers.deposits import index_deposits
@@ -21,7 +21,13 @@ console = Console()
 
 def cmd_index(args: argparse.Namespace) -> None:
     """Index trades, deposits, and market metadata for given wallets."""
-    wallets = [w.strip().lower() for w in args.wallets.split(",")]
+    if args.all:
+        wallets = [w.lower() for w in KNOWN_INSIDERS + NORMAL_WALLETS]
+    elif args.wallets:
+        wallets = [w.strip().lower() for w in args.wallets.split(",")]
+    else:
+        console.print("[red]Specify --wallets or --all[/red]")
+        sys.exit(1)
 
     console.print(f"\n[bold]Indexing {len(wallets)} wallet(s)...[/bold]\n")
 
@@ -134,7 +140,8 @@ def main() -> None:
 
     # index subcommand
     idx = sub.add_parser("index", help="Index trades, deposits, and markets via Polymarket API")
-    idx.add_argument("--wallets", required=True, help="Comma-separated wallet addresses")
+    idx.add_argument("--wallets", help="Comma-separated wallet addresses")
+    idx.add_argument("--all", action="store_true", help="Index all known insiders + normal wallets")
 
     # detect subcommand
     det = sub.add_parser("detect", help="Run insider detection on indexed wallets")

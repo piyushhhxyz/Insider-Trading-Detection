@@ -36,8 +36,11 @@ uv sync
 ## Usage
 
 ```bash
-# 1. Index wallet data
-uv run python -m src.main index --wallets 0xee50a31c...,0x6baf05d1...
+# 1. Index all known insiders + normal wallets
+uv run python -m src.main index --all
+
+# Or index specific wallets
+# uv run python -m src.main index --wallets 0xee50a31c...,0x6baf05d1...
 
 # 2. Run detection on all indexed wallets
 uv run python -m src.main detect --all

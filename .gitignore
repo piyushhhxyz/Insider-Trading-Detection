@@ -1,0 +1,47 @@
+############################
+# Python build artifacts
+############################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+############################
+# Virtual environments
+############################
+.venv/
+venv/
+env/
+
+############################
+# Environment & secrets
+############################
+.env
+.env.*
+!.env.example
+
+############################
+# Databases & local data
+############################
+*.db
+*.sqlite
+*.sqlite3
+
+############################
+# OS / editor files
+############################
+.DS_Store
+.idea/
+.vscode/
+
+############################
+# Tools / cache
+############################
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/

@@ -80,7 +80,8 @@ class WalletFreshness(Signal):
 class OutcomeCertainty(Signal):
     """Bought at low odds, bet big, and won. Suggests foreknowledge.
 
-    Uses REDEEM events as proof of winning (since Gamma API doesn't expose resolution).
+    Detects per-market wins using resolved outcome prices from Gamma API,
+    plus REDEEM events as fallback proof of winning.
     """
 
     def evaluate(self, wallet: str, repo: Repository) -> SignalScore:
@@ -94,8 +95,6 @@ class OutcomeCertainty(Signal):
                 details={"reason": "no trades"},
             )
 
-        # REDEEM events prove the wallet won on that market
-        # Redemption amounts > buy amounts = profitable win
         redemptions = [d for d in deposits if d.from_address == "market_redemption"]
         total_redeemed = sum(r.amount_usdc for r in redemptions)
 
@@ -114,11 +113,10 @@ class OutcomeCertainty(Signal):
             )
 
         certainty_scores: list[float] = []
-        details_list: list[dict] = []
 
         total_bought = sum(t.amount_usdc for t in trades if t.side == Side.BUY)
-        # If total redeemed > total bought, the wallet profited overall
         has_profitable_redemptions = total_redeemed > total_bought
+        wins_detected = 0
 
         for token_id, buy_trades in buys_by_token.items():
             avg_price = sum(t.price for t in buy_trades) / len(buy_trades)
@@ -129,8 +127,19 @@ class OutcomeCertainty(Signal):
             )
             potential_payout_ratio = (1.0 / avg_price) if avg_price > 0 else 0.0
 
-            # If we have redemptions and the wallet was profitable, treat as "won"
-            won = has_profitable_redemptions
+            # Per-market win detection: check if this token is the winning side
+            won_this_market = False
+            market = repo.get_market_by_token(token_id)
+            if market and market.closed and market.clob_token_ids and market.outcome_prices:
+                for i, op in enumerate(market.outcome_prices):
+                    if op >= 0.95 and i < len(market.clob_token_ids):
+                        if market.clob_token_ids[i] == token_id:
+                            won_this_market = True
+                            wins_detected += 1
+                        break
+
+            # Won = per-market win OR wallet-wide profitability
+            won = won_this_market or has_profitable_redemptions
 
             if won and bought_cheap and potential_payout_ratio >= SCORING.certainty_min_payout_ratio:
                 certainty_scores.append(1.0)
@@ -140,14 +149,6 @@ class OutcomeCertainty(Signal):
                 certainty_scores.append(0.4)
             else:
                 certainty_scores.append(0.1)
-
-            details_list.append({
-                "token_id": token_id[:16] + "...",
-                "avg_price": round(avg_price, 4),
-                "total_usdc": round(total_usdc, 2),
-                "won": won,
-                "payout_ratio": round(potential_payout_ratio, 2),
-            })
 
         final_score = max(certainty_scores) if certainty_scores else 0.0
 
@@ -159,7 +160,8 @@ class OutcomeCertainty(Signal):
                 "total_bought": round(total_bought, 2),
                 "total_redeemed": round(total_redeemed, 2),
                 "profitable": has_profitable_redemptions,
-                "positions_count": len(details_list),
+                "per_market_wins": wins_detected,
+                "positions_count": len(certainty_scores),
             },
         )
 
@@ -233,7 +235,11 @@ class EntryTiming(Signal):
 
 
 class MarketFocus(Signal):
-    """Only traded in 1-2 markets. Targeted insider knowledge."""
+    """Targeted insider knowledge — few markets OR heavy volume concentration.
+
+    An insider can trade many markets as cover but concentrate big money on 1-2.
+    Uses both raw market count AND volume concentration (% in top market).
+    """
 
     def evaluate(self, wallet: str, repo: Repository) -> SignalScore:
         trades = repo.get_wallet_trades(wallet)
@@ -245,33 +251,69 @@ class MarketFocus(Signal):
                 details={"reason": "no trades"},
             )
 
-        # Count unique markets (condition_ids) via token→market mapping
+        buy_trades = [t for t in trades if t.side == Side.BUY]
+        if not buy_trades:
+            return SignalScore(
+                name="MarketFocus",
+                score=0.0,
+                weight=SCORING.market_focus_weight,
+                details={"reason": "no buy trades"},
+            )
+
+        # Map tokens to markets, track volume per market
         unique_markets: set[str] = set()
         unmapped_tokens: set[str] = set()
-        for token_id in {t.token_id for t in trades}:
-            market = repo.get_market_by_token(token_id)
+        volume_by_market: dict[str, float] = defaultdict(float)
+
+        for t in buy_trades:
+            market = repo.get_market_by_token(t.token_id)
             if market:
                 unique_markets.add(market.condition_id)
+                volume_by_market[market.condition_id] += t.amount_usdc
             else:
-                unmapped_tokens.add(token_id)
+                unmapped_tokens.add(t.token_id)
+                volume_by_market[t.token_id] += t.amount_usdc
 
-        # If we can't map tokens, count unique token_ids as proxy
         n_markets = len(unique_markets) or len(unmapped_tokens)
 
+        # Count-based score (original logic)
         if n_markets <= 1:
-            score = SCORING.focus_single_market_score
+            count_score = SCORING.focus_single_market_score
         elif n_markets == 2:
-            score = SCORING.focus_two_markets_score
+            count_score = SCORING.focus_two_markets_score
         elif n_markets == 3:
-            score = SCORING.focus_three_markets_score
+            count_score = SCORING.focus_three_markets_score
         else:
-            score = max(0.1, 1.0 - (n_markets - 1) * 0.15)
+            count_score = max(0.1, 1.0 - (n_markets - 1) * 0.15)
+
+        # Volume concentration: what % of buy volume is in the top market
+        total_volume = sum(volume_by_market.values())
+        max_market_vol = max(volume_by_market.values()) if volume_by_market else 0
+        top_pct = max_market_vol / total_volume if total_volume > 0 else 0
+
+        if top_pct >= 0.80:
+            conc_score = 1.0
+        elif top_pct >= 0.50:
+            conc_score = 0.7
+        elif top_pct >= 0.30:
+            conc_score = 0.5
+        elif top_pct >= 0.15:
+            conc_score = 0.3
+        else:
+            conc_score = 0.1
+
+        # Take the higher of count-based or concentration-based
+        score = max(count_score, conc_score)
 
         return SignalScore(
             name="MarketFocus",
             score=score,
             weight=SCORING.market_focus_weight,
-            details={"unique_markets": n_markets},
+            details={
+                "unique_markets": n_markets,
+                "top_market_pct": round(top_pct, 2),
+                "top_market_vol": round(max_market_vol, 2),
+            },
         )
 
 
@@ -370,13 +412,20 @@ class SurgicalBehavior(Signal):
                 # Redemptions should come after trading
                 chronological = first_redeem >= last_trade
 
-        # Profitability: redeemed more than spent
+        # Profitability: redeemed more than spent (wallet-wide)
         profitable = total_redeemed > total_bought if total_bought > 0 else False
         profit_ratio = total_redeemed / total_bought if total_bought > 0 else 0
+
+        # Large individual redemption = big win on at least one market
+        max_redemption = max((r.amount_usdc for r in redemptions), default=0)
+        has_large_win = max_redemption >= 10_000  # $10K+ single redemption
 
         # The full surgical pattern: fund → bet → win big → cash out
         if has_trades and has_redemptions and chronological and profitable and profit_ratio >= 1.5:
             score = SCORING.surgical_full_pattern_score
+        elif has_trades and has_redemptions and chronological and has_large_win:
+            # Big win even if not profitable overall (insider hides among losses)
+            score = SCORING.surgical_partial_pattern_score
         elif has_trades and has_redemptions and profitable:
             score = SCORING.surgical_partial_pattern_score
         elif has_trades and has_redemptions:
@@ -399,6 +448,7 @@ class SurgicalBehavior(Signal):
                 "total_bought": round(total_bought, 2),
                 "total_redeemed": round(total_redeemed, 2),
                 "profit_ratio": round(profit_ratio, 2),
+                "max_redemption": round(max_redemption, 2),
             },
         )
 

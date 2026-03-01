@@ -2,10 +2,6 @@
 
 Behavioral analysis system to detect insider trading on Polymarket prediction markets. Scores wallets on 6 signals and classifies them as LOW / MEDIUM / HIGH / CRITICAL risk.
 
-## Demo
-
-> **Loom Video**: [TODO: Add loom video link here — approach walkthrough + dry run + script execution]
-
 ## Results
 
 Validated against 8 known insider wallets + 10 normal wallets (control group):
@@ -13,18 +9,21 @@ Validated against 8 known insider wallets + 10 normal wallets (control group):
 | Wallet | Label | Score | Risk |
 |--------|-------|-------|------|
 | `0x7f1329ad...` | gj1 (Trump pardon CZ) | 0.880 | CRITICAL |
-| `0x6baf05d1...` | SBet365 (Maduro) | 0.805 | HIGH |
-| `0x0afc7ce5...` | ricosuave (Israel/Iran) | 0.760 | HIGH |
-| `0x31a56e9e...` | unnamed (Maduro) | 0.708 | HIGH |
-| `0xee50a31c...` | AlphaRaccoon (Google d4vd) | 0.700 | HIGH |
+| `0x6baf05d1...` | SBet365 (Maduro) | 0.850 | CRITICAL |
+| `0x0afc7ce5...` | ricosuave (Israel/Iran) | 0.820 | HIGH |
+| `0xee50a31c...` | AlphaRaccoon (Google d4vd) | 0.805 | HIGH |
+| `0x4dfd481c...` | Magamyman (US strike Iran)* | 0.805 | HIGH |
+| `0x31a56e9e...` | unnamed (Maduro) | 0.775 | HIGH |
 | `0xc51eedc0...` | hogriddahhhh (Spotify scraper) | 0.640 | MEDIUM |
-| `0x55ea982c...` | flaccidwillie (DraftKings) | 0.505 | MEDIUM |
-| `0x976685b6...` | fromagi (MicroStrategy) | 0.490 | LOW |
-| Normal wallets (10) | — | 0.574 avg | MEDIUM |
+| `0x55ea982c...` | flaccidwillie (DraftKings) | 0.550 | MEDIUM |
+| `0x976685b6...` | fromagi (MicroStrategy) | 0.505 | MEDIUM |
+| Normal wallets (10) | — | 0.645 avg | MEDIUM |
 
-- **5/8 insiders** flagged HIGH or CRITICAL
+*Magamyman was not in the assignment — discovered independently and tested to validate the algorithm.
+
+- **5/8 assignment insiders** flagged HIGH or CRITICAL
 - **0/10 normals** flagged HIGH — zero false positives
-- **+0.112 point separation** between insider avg (0.686) and normal avg (0.574)
+- **+0.083 point separation** between insider avg (0.728) and normal avg (0.645)
 
 ## Setup
 
